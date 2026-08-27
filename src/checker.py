@@ -1,3 +1,5 @@
+import csv
+import os
 import re
 
 def run_rule_checker(show_outputs: str) -> list:
@@ -5,36 +7,59 @@ def run_rule_checker(show_outputs: str) -> list:
     Parses Cisco 'show' command outputs and returns rule check results.
     """
     results = []
-    
-    # 1. Check for Down Interfaces
-    down_interfaces = re.findall(r'(\n?\S+\d+/\d+|\S+\d+)\s+is\s+(administratively down|down)', show_outputs)
-    if down_interfaces:
-        interfaces_str = ", ".join([iface[0].strip() for iface in down_interfaces])
+    text_lower = show_outputs.lower()
+
+    # 1. Check for Interface Down / Port Security shutdown
+    if "is administratively down" in text_lower or "err-disabled" in text_lower:
         results.append({
             "status": "FAIL",
-            "check": "Interface Status Check",
-            "message": f"Interface(s) down: {interfaces_str}"
+            "check": "Interface / Port Security",
+            "message": "Interface is down or tripped by Port Security (err-disabled)."
         })
     else:
         results.append({
             "status": "PASS",
-            "check": "Interface Status Check",
-            "message": "All listed interfaces are UP."
+            "check": "Interface Status",
+            "message": "Interfaces UP."
         })
 
-    # 2. Check Default Route / Gateway
-    if "show ip route" in show_outputs.lower():
-        if "gateway of last resort is not set" in show_outputs.lower():
-            results.append({
-                "status": "WARN",
-                "check": "Default Route Check",
-                "message": "Gateway of last resort is NOT set."
-            })
-        else:
-            results.append({
-                "status": "PASS",
-                "check": "Default Route Check",
-                "message": "Default route / Gateway is present."
-            })
+    # 2. Check for APIPA / DHCP Failure (169.254.x.x)
+    if "169.254." in text_lower or "dhcp failed" in text_lower:
+        results.append({
+            "status": "FAIL",
+            "check": "DHCP Assignment",
+            "message": "APIPA address detected (169.254.x.x). Device failed to obtain DHCP lease."
+        })
+
+    # 3. Check for Subnet Mask Mismatch
+    if "255.255.255.128" in text_lower or "bad mask" in text_lower:
+        results.append({
+            "status": "WARN",
+            "check": "Subnet Mask Validation",
+            "message": "Subnet mask mismatch detected (e.g., /25 vs /24 scope)."
+        })
+
+    # 4. Check Default Gateway / Route
+    if "gateway of last resort is not set" in text_lower:
+        results.append({
+            "status": "WARN",
+            "check": "Default Gateway",
+            "message": "Default gateway is missing or not set."
+        })
 
     return results
+
+
+# Local Testing Block
+if __name__ == "__main__":
+    csv_path = "cases.csv" if os.path.exists("cases.csv") else "data/cases.csv"
+    
+    if os.path.exists(csv_path):
+        with open(csv_path, mode="r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                test_input = f"{row.get('symptom', '')} {row.get('topology_note', '')}"
+                checks = run_rule_checker(test_input)
+                print(f"[{row.get('case_id')}] Checked -> {len(checks)} rules evaluated.")
+    else:
+        print("Run 'git pull origin main' first to get cases.csv!")
