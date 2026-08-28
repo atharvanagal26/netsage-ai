@@ -4,16 +4,19 @@ LLM integration layer for the Network Troubleshooting Diagnosis project.
 
 Responsibilities:
 1. Load the diagnosis system prompt from diagnose_prompt.md.
-2. Send case evidence to the LLM through the OpenAI Responses API.
-3. Enforce a strict JSON schema for the diagnosis response.
+2. Send case evidence to the LLM (Groq or OpenAI).
+3. Enforce strict JSON output matching the Diagnosis Pydantic schema.
 4. Return a normal Python dictionary to the Streamlit/UI layer.
 
 Install:
     pip install openai pydantic python-dotenv
 
 Environment:
-    OPENAI_API_KEY=your_api_key
-    OPENAI_MODEL=gpt-4o-mini   # change if required by your project/account
+    GROQ_API_KEY=gsk_your_groq_api_key   # Primary API key
+    GROQ_MODEL=llama-3.3-70b-versatile   # Default Groq model
+    # OR
+    OPENAI_API_KEY=your_openai_api_key   # Fallback API key
+    OPENAI_MODEL=gpt-4o-mini
 """
 
 from __future__ import annotations
@@ -27,11 +30,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROMPT_PATH = BASE_DIR / "diagnose_prompt.md"
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 class Evidence(BaseModel):
@@ -107,19 +109,33 @@ def diagnose_case(
     model: str | None = None,
 ) -> dict[str, Any]:
     """
-    Diagnose one networking case.
-
-    The deterministic checker is the first line of evidence. The LLM explains
-    the evidence, resolves ambiguity, and proposes verification/remediation
-    steps. The LLM must not override explicit deterministic evidence without
-    explaining the conflict.
+    Diagnose one networking case using Groq or OpenAI.
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key and client is None:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
+    groq_key = os.getenv("GROQ_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
 
-    client = client or OpenAI(api_key=api_key)
-    model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    api_key = groq_key or openai_key
+    if not api_key and client is None:
+        raise RuntimeError("Neither GROQ_API_KEY nor OPENAI_API_KEY is set in environment.")
+
+    is_groq = bool(groq_key) and client is None
+
+    # Initialize client for Groq or OpenAI
+    if client is None:
+        if is_groq:
+            client = OpenAI(
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1"
+            )
+        else:
+            client = OpenAI(api_key=openai_key)
+
+    # Determine default model
+    if model is None:
+        if is_groq:
+            model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+        else:
+            model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     system_prompt = load_system_prompt()
     user_input = _build_user_input(
@@ -130,31 +146,48 @@ def diagnose_case(
         deterministic_results,
     )
 
-    response = client.responses.parse(
-        model=model,
-        instructions=system_prompt,
-        input=user_input,
-        text_format=Diagnosis,
+    schema_prompt = (
+        f"{system_prompt}\n\n"
+        "Respond ONLY with a valid JSON object strictly matching this schema format:\n"
+        "{\n"
+        '  "case_id": "string",\n'
+        '  "diagnosis": "string",\n'
+        '  "fault_category": "VLAN" | "DHCP" | "DNS" | "Routing" | "ACL" | "NAT" | "Wireless" | "Unknown",\n'
+        '  "severity": "Low" | "Medium" | "High" | "Critical" | "Unknown",\n'
+        '  "confidence": 0.0 to 1.0,\n'
+        '  "root_cause": "string",\n'
+        '  "explanation": "string",\n'
+        '  "recommended_actions": ["string"],\n'
+        '  "verification_commands": ["string"],\n'
+        '  "evidence": [{"source": "symptom"|"topology"|"show_output"|"deterministic_checker"|"inference", "detail": "string"}],\n'
+        '  "deterministic_status": "PASS" | "FAIL" | "WARN" | "NOT_AVAILABLE",\n'
+        '  "needs_human_review": boolean\n'
+        "}"
     )
 
-    # Refusals or unexpected output should be surfaced clearly.
-    for item in response.output:
-        if getattr(item, "type", None) != "message":
-            continue
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": schema_prompt},
+            {"role": "user", "content": user_input},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+    )
 
-        for content in getattr(item, "content", []):
-            if getattr(content, "type", None) != "output_text":
-                continue
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError("No structured diagnosis response returned by the LLM.")
 
-            parsed = getattr(content, "parsed", None)
-            if parsed is not None:
-                return parsed.model_dump()
-
-            refusal = getattr(content, "refusal", None)
-            if refusal:
-                raise RuntimeError(f"LLM refused the diagnosis request: {refusal}")
-
-    raise RuntimeError("No structured diagnosis was returned by the LLM.")
+    try:
+        parsed_diagnosis = Diagnosis.model_validate_json(content)
+        return parsed_diagnosis.model_dump()
+    except ValidationError as e:
+        # Fallback raw dictionary parse if minor Pydantic validation error occurs
+        try:
+            return json.loads(content)
+        except Exception:
+            raise RuntimeError(f"Failed to parse diagnosis output as valid JSON:\n{e}\nRaw output:\n{content}")
 
 
 def diagnose_case_json(*args: Any, **kwargs: Any) -> str:
@@ -164,7 +197,6 @@ def diagnose_case_json(*args: Any, **kwargs: Any) -> str:
 
 
 if __name__ == "__main__":
-    # Simple local smoke test. It requires OPENAI_API_KEY.
     sample = diagnose_case(
         case_id="CASE_021",
         symptom="Router-1 cannot reach Subnet 172.16.2.0/24 behind Router-2.",
